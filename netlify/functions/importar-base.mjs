@@ -1,0 +1,100 @@
+import { createClient } from '@supabase/supabase-js'
+
+const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8' }
+const allowedSegments = new Set(['TOTAL','HFC','GPON','GPON PURO','REDE NEUTRA','HIBRIDO'])
+const allowedStates = new Set(['PR','SC'])
+
+function response(status, body) {
+  return new Response(JSON.stringify(body), { status, headers: JSON_HEADERS })
+}
+
+export default async (req) => {
+  if (req.method !== 'POST') return response(405, { error: 'Metodo nao permitido.' })
+
+  const url = process.env.SUPABASE_URL
+  const secret = process.env.SUPABASE_SECRET_KEY
+  const publishable = process.env.SUPABASE_PUBLISHABLE_KEY
+  if (!url || !secret || !publishable) return response(500, { error: 'Configuracao Supabase incompleta no Netlify.' })
+
+  const auth = req.headers.get('authorization') || ''
+  if (!auth.startsWith('Bearer ')) return response(401, { error: 'Sessao ausente.' })
+  const jwt = auth.slice(7)
+
+  // Validate the JWT independently of the elevated admin client.
+  const userClient = createClient(url, publishable, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    global: { headers: { Authorization: `Bearer ${jwt}` } }
+  })
+  const { data: userData, error: userError } = await userClient.auth.getUser(jwt)
+  if (userError || !userData?.user) return response(401, { error: 'Sessao invalida ou expirada.' })
+
+  const admin = createClient(url, secret, { auth: { persistSession: false, autoRefreshToken: false } })
+  const { data: profile, error: profileError } = await admin
+    .from('at1_usuarios').select('id,perfil,ativo').eq('id', userData.user.id).maybeSingle()
+  if (profileError) return response(500, { error: 'Falha ao validar perfil administrativo.' })
+  if (!profile || profile.ativo !== true || profile.perfil !== 'ADMIN') return response(403, { error: 'Apenas ADMIN ativo pode importar bases.' })
+
+  let payload
+  try { payload = await req.json() } catch { return response(400, { error: 'JSON invalido.' }) }
+  const competencia = String(payload.competencia || '')
+  const tipoApuracao = String(payload.tipo_apuracao || '').toUpperCase()
+  const nomeArquivo = String(payload.nome_arquivo || 'BASE-RPS.xlsx').slice(0, 250)
+  const rows = Array.isArray(payload.rows) ? payload.rows : []
+
+  if (!/^\d{4}-\d{2}-01$/.test(competencia)) return response(400, { error: 'Competencia invalida. Use YYYY-MM-01.' })
+  if (!['PARCIAL','FECHAMENTO'].includes(tipoApuracao)) return response(400, { error: 'Tipo de apuracao invalido.' })
+  if (!rows.length) return response(400, { error: 'Nenhuma linha recebida.' })
+  if (rows.length > 20000) return response(413, { error: 'Carga excede o limite desta rotina.' })
+
+  const normalized = []
+  const seen = new Set()
+  for (const r of rows) {
+    const estado = String(r.estado || '').trim().toUpperCase()
+    const municipio = String(r.municipio || '').trim()
+    const segmento = String(r.segmento || '').trim().toUpperCase()
+    const quantidade = Number(r.quantidade_clientes)
+    if (!allowedStates.has(estado)) return response(400, { error: `Estado invalido: ${estado}` })
+    if (!municipio) return response(400, { error: 'Municipio vazio na carga.' })
+    if (!allowedSegments.has(segmento)) return response(400, { error: `Segmento invalido: ${segmento}` })
+    if (!Number.isFinite(quantidade) || quantidade < 0 || !Number.isInteger(quantidade)) return response(400, { error: `Quantidade invalida em ${municipio}/${segmento}` })
+    const key = `${estado}|${municipio.toLocaleUpperCase('pt-BR')}|${segmento}`
+    if (seen.has(key)) return response(400, { error: `Duplicidade: ${estado} / ${municipio} / ${segmento}` })
+    seen.add(key)
+    normalized.push({ estado, municipio, segmento, quantidade_clientes: quantidade })
+  }
+  for (const seg of allowedSegments) {
+    if (!normalized.some(r => r.segmento === seg)) return response(400, { error: `Segmento obrigatorio ausente: ${seg}` })
+  }
+
+  const { data: imp, error: impError } = await admin.from('at1_importacoes').insert({
+    tipo_base: 'CLIENTES', competencia, tipo_apuracao: tipoApuracao, nome_arquivo: nomeArquivo,
+    quantidade_registros: 0, status: 'PROCESSANDO', usuario_id: userData.user.id,
+    mensagem: 'Carga recebida pela Netlify Function.'
+  }).select('id').single()
+  if (impError) return response(500, { error: 'Falha ao iniciar importacao.', detail: impError.message })
+
+  const importacaoId = imp.id
+  try {
+    const staging = normalized.map(r => ({
+      importacao_id: importacaoId, competencia, tipo_apuracao: tipoApuracao,
+      estado: r.estado, municipio: r.municipio, segmento: r.segmento, quantidade_clientes: r.quantidade_clientes
+    }))
+    for (let i = 0; i < staging.length; i += 500) {
+      const { error } = await admin.from('at1_staging_clientes').insert(staging.slice(i, i + 500))
+      if (error) throw error
+    }
+
+    // This RPC is intentionally not executable by browser roles. The secret-key server client can execute it.
+    const { data: promoted, error: promoteError } = await admin.rpc('promover_base_clientes', { p_importacao_id: importacaoId })
+    if (promoteError) throw promoteError
+    return response(200, { ok: true, importacao_id: importacaoId, registros: promoted })
+  } catch (err) {
+    await admin.from('at1_importacoes').update({
+      status: 'ERRO', concluido_em: new Date().toISOString(), mensagem: String(err?.message || err).slice(0, 1000)
+    }).eq('id', importacaoId)
+    await admin.from('at1_staging_clientes').delete().eq('importacao_id', importacaoId)
+    return response(500, { error: 'A importacao nao foi promovida.', detail: String(err?.message || err) })
+  }
+}
+
+export const config = { path: '/api/importar-base' }
