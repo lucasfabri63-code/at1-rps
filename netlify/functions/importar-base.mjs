@@ -85,7 +85,7 @@ export default async (req) => {
     }
 
     // This RPC is intentionally not executable by browser roles. The secret-key server client can execute it.
-    const { data: promoted, error: promoteError } = await admin.rpc('promover_base_clientes', { p_importacao_id: importacaoId })
+    const { data: promoted, error: promoteError } = await userClient.rpc('promover_base_clientes', { p_importacao_id: importacaoId })
     if (promoteError) throw promoteError
     return response(200, { ok: true, importacao_id: importacaoId, registros: promoted })
   } catch (err) {
