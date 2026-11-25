@@ -278,7 +278,7 @@ var RF=(function(){
     });
     bar._ws=ws;
     // esconde filtros antigos de UF/visão/município (substituídos pela região)
-    host.querySelectorAll('[data-f=uf],[data-f=city],[data-df=uf],[data-mf=uf],[data-nf=uf],[data-nf=city],[data-re=grupo],[data-re=municipio]').forEach(function(s){
+    host.querySelectorAll('[data-f=uf],[data-f=city],[data-df=uf],[data-mf=uf],[data-nf=uf],[data-nf=city],[data-re=grupo],[data-re=municipio],[data-map=uf],[data-map=city]').forEach(function(s){
       if(s.tagName==='SELECT'){if(s.querySelector('option[value=RPS]')||Array.from(s.options).some(function(o){return o.textContent==='RPS'}))s.value='RPS';else s.value='';}
       var f=s.closest('.f');if(f)f.style.display='none';
     });
@@ -353,8 +353,75 @@ var RF=(function(){
 })();
 
 
-/* Visão Gerencial: linha extra "Seleção" quando houver filtro de região */
-(function(){var _rm=renderManager;renderManager=async function(){await _rm();if(!RF.active())return;let p=document.getElementById('p-gerencial');for(let d of pages){let el=p.querySelector(`[data-mgr="${d[2]}"]`),ch=el&&Chart.getChart(el);if(!ch)continue;try{let {data,error}=await at1Supabase.rpc('portal_segment_history',{p_competencia_final:MONTH+'-01',p_segmento:d[2],p_abrangencia:'RPS',p_municipio:null,p_meses:12,p_municipios:RF.keys()});if(error)throw error;let m={};(data.meses||[]).forEach(x=>{m[monthLabel(String(x.competencia).slice(0,7))]=x.indicador===null?null:Number(x.indicador)});ch.data.datasets.push({label:'Seleção: '+RF.label(),data:ch.data.labels.map(l=>m[l]??null),borderColor:'#1f77b4',backgroundColor:'#1f77b4',borderDash:[6,4],pointRadius:5,datalabels:{align:'right',anchor:'center',offset:8,backgroundColor:'#1f77b4'}});let all=ch.data.datasets.flatMap(x=>x.data.filter(v=>v!==null&&v!==undefined));ch.options.scales.y.suggestedMax=Math.max(1,...all)*1.24;ch.update()}catch(e){console.warn('Seleção gerencial',e)}}}})();
+/* Visão Gerencial: uma linha por item selecionado (UF, Cluster, Subcluster, Município) com rótulos */
+(function(){
+var _rm=renderManager,COLORS=['#1f77b4','#2ca02c','#9467bd','#ff7f0e','#17becf','#8c564b','#e377c2','#bcbd22','#3949ab','#00897b'];
+function selLines(){
+  var st=RF.state,dims=[['uf','UF'],['cluster',''],['sub',''],['mun','']],out=[];
+  dims.forEach(function(d){
+    st.sel[d[0]].forEach(function(v){
+      var ks=new Set();st.rows.forEach(function(r){if(r[d[0]]===v)ks.add(r.k)});
+      if(ks.size)out.push({label:(d[1]?d[1]+' ':'')+v,keys:Array.from(ks)});
+    });
+  });
+  return out;
+}
+renderManager=async function(){
+  await _rm();if(!RF.active())return;
+  var lines=selLines();if(!lines.length)return;
+  var p=document.getElementById('p-gerencial');
+  for(var d of pages){
+    var el=p.querySelector('[data-mgr="'+d[2]+'"]'),ch=el&&Chart.getChart(el);if(!ch)continue;
+    var labels=ch.data.labels.slice(),base=ch.data.datasets.map(function(x){return Object.assign({},x,{data:x.data.slice()})}),opts=ch.config.options,extra=[];
+    for(var i=0;i<lines.length;i++){
+      try{
+        var r=await at1Supabase.rpc('portal_segment_history',{p_competencia_final:MONTH+'-01',p_segmento:d[2],p_abrangencia:'RPS',p_municipio:null,p_meses:12,p_municipios:lines[i].keys});
+        if(r.error)throw r.error;
+        var m={};(r.data.meses||[]).forEach(function(x){m[monthLabel(String(x.competencia).slice(0,7))]=x.indicador===null?null:Number(x.indicador)});
+        var c=COLORS[i%COLORS.length];
+        extra.push({label:lines[i].label,data:labels.map(function(l){return m[l]??null}),borderColor:c,backgroundColor:c,borderDash:[6,4],pointRadius:5,pointHoverRadius:7,
+          datalabels:{display:function(x){return x.raw!==null&&x.raw!==undefined},align:i%2?'bottom':'top',anchor:'end',offset:8,backgroundColor:c,color:'#fff'}});
+      }catch(e){console.warn('Seleção gerencial',e)}
+    }
+    var all=base.concat(extra),vals=all.flatMap(function(x){return x.data.filter(function(v){return v!==null&&v!==undefined})});
+    opts.scales.y.suggestedMax=Math.max(1,...vals)*1.24;
+    chart(el,'line',{labels:labels,datasets:all},opts);
+  }
+};
+})();
+
+/* Comparativo: usa os filtros UF/Grupo, Cluster, Subcluster e Município (multisseleção) */
+renderCompare=async function(){
+  if(!PORTAL_READY)return;
+  var p=document.getElementById('p-comparativo'),segSel=p.querySelector('[data-map=seg]'),segs=dynamicSegments();
+  if(!segSel.options.length)segSel.innerHTML=segs.map(function(x){return '<option>'+x+'</option>'}).join('');
+  var seg=segSel.value||segs[0],f={uf:'RPS',city:''};
+  var base=baseRows(seg,f).reduce(function(z,r){return z+r.vol},0),att=opsRows(seg,f).filter(atend).length,at1=base?att/base*100:null,goal=at1Goal(seg);
+  document.getElementById('mapKpiAtt').textContent=fmt(att);document.getElementById('mapKpiBase').textContent=fmt(base);
+  var k=document.getElementById('mapKpiAt1');k.textContent=at1===null?'Sem base':at1.toFixed(2).replace('.',',')+'%';k.className=goalClass(at1,goal);
+  document.getElementById('mapKpiGoal').textContent=goal===null?'Meta não cadastrada':'Meta '+goal.toFixed(2).replace('.',',')+'%';
+  document.getElementById('cityDrill').classList.remove('show');
+  // estados que aparecem no mapa = estados dos municípios selecionados (ou PR e SC)
+  var ufs=new Set();DB.base.forEach(function(r){if(r.seg===seg&&RF.has(r.city)&&(r.uf==='PR'||r.uf==='SC'))ufs.add(r.uf)});
+  ufs=Array.from(ufs).sort();if(!ufs.length)ufs=['PR','SC'];
+  document.getElementById('mapTitle').textContent='Mapa municipal · '+(RF.active()?RF.label():ufs.join(' + '))+' · '+seg;
+  var metrics={},ufOf={};ufs.forEach(function(u){var m=municipalMetrics(u,seg);Object.keys(m).forEach(function(c){metrics[u+'|'+c]=m[c];ufOf[u+'|'+c]=u})});
+  var sel=Object.keys(metrics).filter(function(c){return metrics[c].base>0});
+  if(sel.length===1){var only=metrics[sel[0]];renderCityDrill(ufOf[sel[0]],seg,only.city)}
+  var requestId=++MAP_REQUEST_ID,map=initMap();if(!map)return;
+  try{
+    var geos=[];for(var u of ufs){geos.push([u,await loadIbgeGeo(u)])}
+    if(requestId!==MAP_REQUEST_ID)return;
+    var group=L.featureGroup();
+    geos.forEach(function(g){
+      L.geoJSON(g[1],{style:function(ft){var d=metrics[g[0]+'|'+N(geoName(ft))];return{color:'#fff',weight:1,fillColor:heatColor(d&&d.base?d.at1:null,goal),fillOpacity:.82}},
+        onEachFeature:function(ft,layer){var name=geoName(ft),d=metrics[g[0]+'|'+N(name)];if(d&&!d.base)d=null;
+          layer.bindTooltip('<b>'+name+'</b><br>'+(d?'Atendimentos: '+fmt(d.att)+'<br>Base: '+fmt(d.base)+'<br>AT1: '+(d.at1===null?'Sem base':d.at1.toFixed(2).replace('.',',')+'%'):'Fora da seleção / sem informação'));
+          layer.on('click',function(){if(d)renderCityDrill(g[0],seg,d.city)})}}).addTo(group);
+    });
+    group.addTo(map);MUNICIPAL_LAYER=group;map.fitBounds(group.getBounds(),{padding:[10,10]});
+  }catch(e){document.getElementById('municipalMap').innerHTML='<div class=mapUnavailable><b>'+e.message+'</b><br>Os indicadores continuam vindo do Supabase. Recarregue a página para tentar novamente.</div>'}
+};
 
 Chart.register(ChartDataLabels);init();restoreAt1Session();
 </script><script>
@@ -581,63 +648,4 @@ Chart.register(ChartDataLabels);init();restoreAt1Session();
       '<div class=reKpi><b>Competência</b><div style="font-size:18px">'+esc(mLabel(RE.month))+'</div></div>';
     // chips das seleções
     var s=RE.sel,names={grupo:'Grupo',municipio:'Município',endereco:'Endereço',familia:'Família'},chips=[];
-    Object.keys(names).forEach(function(k){if(s[k]){var t=k==='endereco'?s[k].split('|||').join(' – '):s[k];chips.push('<button class=reChip data-re-unsel="'+k+'">'+names[k]+': '+esc(t)+' ✕</button>')}});
-    v.querySelector('[data-re-chips]').innerHTML=chips.length?chips.join('')+'<button class=reClear data-re-clear>Limpar seleção</button>':'';
-    v.querySelectorAll('[data-re-unsel]').forEach(function(b){b.onclick=function(){RE.sel[b.dataset.reUnsel]=null;draw()}});
-    var cl=v.querySelector('[data-re-clear]');if(cl)cl.onclick=function(){resetSel();draw()};
-    ['grupo','municipio','endereco','familia'].forEach(drawTable);
-  }
-
-  function drawTable(dim){
-    var v=document.getElementById('detailReinc'),host=v.querySelector('[data-re-t='+dim+']');
-    var f=topFilter(),cols=f.prazo?prazos().filter(function(x){return f.prazo.has(x)}):prazos(),data=pivot(rowsFor(dim),dim,cols);
-    var LIMIT=300,shown=data,note='';
-    if(dim==='endereco'){
-      var q=(v.querySelector('[data-re-search]').value||'').trim().toUpperCase();
-      if(q)shown=data.filter(function(x){return String(x.label).toUpperCase().indexOf(q)>=0||String(x.city).toUpperCase().indexOf(q)>=0});
-      if(shown.length>LIMIT){note='<tr><td colspan='+(cols.length+2)+' style="text-align:center;color:#667085">Exibindo os '+LIMIT+' endereços com mais reincidências de '+nf(shown.length)+'. Use a busca ou clique em um município para refinar.</td></tr>';shown=shown.slice(0,LIMIT)}
-    }
-    if(!data.length){host.innerHTML='<div class=reState style="min-height:120px;margin:0"><span>Sem reincidências para os filtros selecionados.</span></div>';return}
-    var max=data[0].total||1,sum={},gt=0;cols.forEach(function(c){sum[c]=0});
-    data.forEach(function(x){cols.forEach(function(c){sum[c]+=x.by[c]||0});gt+=x.total});
-    var title={grupo:'Grupo',municipio:'Município',endereco:'Endereço',familia:'Família'}[dim];
-    host.innerHTML='<table><thead><tr><th>'+title+'</th>'+cols.map(function(c){return '<th>'+esc(c)+'</th>'}).join('')+'<th>Total</th></tr></thead><tbody>'+
-      shown.map(function(x){
-        var on=RE.sel[dim]===x.key;
-        return '<tr data-k="'+encodeURIComponent(x.key)+'" class="'+(on?'reOn':'')+'"><td>'+esc(x.label)+(x.city?'<span class=reCity>'+esc(x.city)+'</span>':'')+
-          '<div class=reBarBox><div class=reBar style="width:'+Math.max(2,x.total/max*100).toFixed(1)+'%"></div></div></td>'+
-          cols.map(function(c){return '<td>'+(x.by[c]?nf(x.by[c]):'')+'</td>'}).join('')+'<td><b>'+nf(x.total)+'</b></td></tr>';
-      }).join('')+note+
-      '</tbody><tfoot><tr><td>Total Geral</td>'+cols.map(function(c){return '<td>'+nf(sum[c])+'</td>'}).join('')+'<td>'+nf(gt)+'</td></tr></tfoot></table>';
-    host.querySelectorAll('tbody tr[data-k]').forEach(function(tr){
-      tr.onclick=function(){
-        var k=decodeURIComponent(tr.dataset.k);
-        RE.sel[dim]=RE.sel[dim]===k?null:k;
-        // ao trocar grupo/município, limpa seleções mais detalhadas que não pertençam mais ao recorte
-        if(dim==='grupo'){RE.sel.municipio=null;RE.sel.endereco=null}
-        if(dim==='municipio'){RE.sel.endereco=null}
-        draw();
-      };
-    });
-  }
-
-  /* ---------- 6) Integração com o portal ---------- */
-  var origOpen=window.openDetailView;
-  if(typeof origOpen==='function'){
-    window.openDetailView=function(view){
-      fixNodesNesting();
-      var v=document.getElementById('detailReinc');if(v)v.classList.remove('active');
-      if(view==='reincidencia')return openReinc();
-      return origOpen.apply(this,arguments);
-    };
-  }
-
-  window.reincRedraw=function(){draw()};
-  function boot(){injectCss();fixNodesNesting();ensureView()}
-  // a página Análise Detalhada é montada pelo init(); tenta até ela existir
-  var tries=0,t=setInterval(function(){tries++;if(document.getElementById('detailHub')){boot();clearInterval(t)}else if(tries>120)clearInterval(t)},500);
-  document.addEventListener('click',function(){if(document.getElementById('detailHub')&&!document.getElementById('hubCardReinc'))boot()},true);
-})();
-
-</script></body></html>
-
+    Object.keys(names).forEach(function(k){if(s[k]){var t=k==='endereco'?
